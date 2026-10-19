@@ -40,4 +40,11 @@ describe OpenSSL::SSL::SSLContext do
     expect(subject.options & OpenSSL::SSL::OP_NO_SSLv3).to eq(OpenSSL::SSL::OP_NO_SSLv3)
   end
 
+  it 'keeps SSLv3 disabled and empty fragments enabled after set_params runs again without options' do
+    subject.set_params
+
+    expect(subject.options & OpenSSL::SSL::OP_NO_SSLv3).to eq(OpenSSL::SSL::OP_NO_SSLv3)
+    expect(subject.options & OpenSSL::SSL::OP_DONT_INSERT_EMPTY_FRAGMENTS).to eq(OpenSSL::SSL::OP_DONT_INSERT_EMPTY_FRAGMENTS)
+  end
+
 end

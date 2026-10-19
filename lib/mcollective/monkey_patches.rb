@@ -132,24 +132,34 @@ class Dir
 end
 
 # Reject all SSLv2 ciphers and all SSLv2 or SSLv3 handshakes by default.
-# The openssl gem freezes DEFAULT_PARAMS from 4.0 on, so the adjusted
-# defaults are passed to set_params on each new context instead of being
-# written into the shared hash.
+# The openssl gem freezes DEFAULT_PARAMS from 4.0 on, so instead of writing
+# into the shared hash the adjusted defaults go to set_params whenever a
+# caller leaves them out. Hooking set_params and not just initialize keeps
+# them in place when another library such as puppet or nats-pure calls
+# set_params again on a context, which on openssl gems before 3.3 replaces
+# the whole options bitmask.
 require "openssl"
 class OpenSSL::SSL::SSLContext # rubocop:disable Style/ClassAndModuleChildren
   alias __mcollective_original_initialize initialize
   private :__mcollective_original_initialize
 
+  alias __mcollective_original_set_params set_params
+  private :__mcollective_original_set_params
+
   def initialize(*args)
     __mcollective_original_initialize(*args)
 
+    set_params
+  end
+
+  def set_params(params={}) # rubocop:disable Naming/AccessorMethodName
     options = (DEFAULT_PARAMS[:options] || 0) | OpenSSL::SSL::OP_NO_SSLv2 | OpenSSL::SSL::OP_NO_SSLv3
     # ruby 1.8.5 doesn't define this constant, but has it on by default
     options |= OpenSSL::SSL::OP_DONT_INSERT_EMPTY_FRAGMENTS if defined?(OpenSSL::SSL::OP_DONT_INSERT_EMPTY_FRAGMENTS)
 
-    params = {:options => options}
-    params[:ciphers] = "#{DEFAULT_PARAMS[:ciphers]}:!SSLv2" if DEFAULT_PARAMS[:ciphers]
+    defaults = {:options => options}
+    defaults[:ciphers] = "#{DEFAULT_PARAMS[:ciphers]}:!SSLv2" if DEFAULT_PARAMS[:ciphers]
 
-    set_params(params)
+    __mcollective_original_set_params(defaults.merge(params))
   end
 end
