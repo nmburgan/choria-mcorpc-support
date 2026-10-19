@@ -349,6 +349,117 @@ module MCollective
         end
       end
 
+      # Calls an action with arguments that differ per node, in one exchange
+      #
+      # args_by_node maps each node's identity to the arguments it gets.
+      # Every node receives an ordinary direct request with its own
+      # arguments and its own request id. The requests are published
+      # together and their replies received together, so nodes with
+      # distinct arguments cost one round trip rather than one each. Batch
+      # mode applies as in call_agent_batched, batch_size nodes at a time
+      # with batch_sleep_time between batches.
+      #
+      # Results, stats and the block behave as for call_agent, with the
+      # stats naming the first request's id.
+      def per_node_request(action, args_by_node, &block) # rubocop:disable Metrics/MethodLength
+        raise "Per node requests require direct addressing" unless Config.instance.direct_addressing
+
+        action = action.to_s
+
+        args_by_node.each do |host, args|
+          raise "Cannot bypass result processing for per node requests" if args[:process_results] == false
+
+          begin
+            validate_request(action, args)
+          rescue DDLValidationError => e
+            raise DDLValidationError, "%s: %s" % [host, e.message], e.backtrace
+          end
+        end
+
+        @stats.reset
+        @stats.discovered_agents(args_by_node.keys.map(&:to_s))
+
+        results = []
+        respcount = 0
+
+        if args_by_node.empty?
+          @stderr.print("\nNo request sent, no nodes were given.")
+        else
+          opts = options
+          flags = {:agent => @agent, :collective => @collective, :filter => opts[:filter], :options => opts}
+          aggregate = load_aggregate_functions(action, @ddl)
+
+          if @progress && !block_given?
+            twirl = Progress.new
+            @stdout.puts
+            @stdout.print twirl.twirl(respcount, args_by_node.size)
+          end
+
+          batch_size = args_by_node.size
+          if @batch_mode
+            validate_batch_size(@batch_size)
+            batch_size = batch_size_for(@batch_size, args_by_node.size)
+          end
+
+          processed_nodes = 0
+
+          args_by_node.each_slice(batch_size) do |batch|
+            messages = batch.map do |host, args|
+              message = Message.new(new_request(action, args), nil, flags)
+              message.discovered_hosts = [host.to_s]
+              # the setter also narrows the filter to the agent filter, as every direct request carries
+              message.type = :direct_request
+              message
+            end
+
+            @client.req(messages) do |resp|
+              respcount += 1
+
+              if block_given?
+                aggregate = process_results_with_block(action, resp, block, aggregate)
+              else
+                @stdout.print twirl.twirl(respcount, args_by_node.size) if @progress
+
+                result, aggregate = process_results_without_block(resp, action, aggregate)
+
+                results << result
+              end
+            end
+
+            @stats.requestid ||= @client.stats[:requestid]
+            @stats.noresponsefrom.concat @client.stats[:noresponsefrom]
+            @stats.unexpectedresponsefrom.concat @client.stats[:unexpectedresponsefrom]
+            @stats.responses += @client.stats[:responses]
+            @stats.blocktime += @client.stats[:blocktime]
+            @stats.totaltime += @client.stats[:totaltime]
+            @stats.discoverytime += @client.stats[:discoverytime]
+
+            processed_nodes += batch.length
+            if args_by_node.size > processed_nodes
+              @stats.blocktime += @batch_sleep_time
+              sleep @batch_sleep_time
+            end
+          end
+
+          results.sort! if @initial_options[:sort]
+
+          @stats.aggregate_summary = aggregate.summarize if aggregate
+          @stats.aggregate_failures = aggregate.failed if aggregate
+        end
+
+        @stats.finish_request
+
+        RPC.stats(@stats)
+
+        @stdout.print("\n") if @progress
+
+        if block_given?
+          stats
+        else
+          [results].flatten
+        end
+      end
+
       def discovery_timeout
         return @discovery_timeout if @discovery_timeout
 
@@ -1030,6 +1141,16 @@ module MCollective
         return true if batch_size != 0 && batch_size != "0"
 
         false
+      end
+
+      # The batch size as a count of nodes, from a count or a percentage of
+      # the nodes given, as call_agent_batched reads it
+      def batch_size_for(batch_size, node_count)
+        if batch_size.is_a?(String) && batch_size =~ /^(\d+)%$/
+          (node_count / 100.0 * Integer($1)).ceil
+        else
+          Integer(batch_size)
+        end
       end
 
       # Validate the bach_size based on the following criteria

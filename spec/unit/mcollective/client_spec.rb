@@ -53,6 +53,21 @@ module MCollective
         result = client.sendreq(request, "rspec")
         expect(result).to eq("13fegbcw")
       end
+
+      it "should advance the request sequence once" do
+        Client.reset_request_sequence
+        request = mock
+        request.stubs(:agent)
+        request.stubs(:ttl)
+        request.stubs(:collective)
+        request.stubs(:requestid).returns("13fegbcw")
+        request.stubs(:publish)
+        client.stubs(:createreq).returns(request)
+
+        client.sendreq(request, "rspec")
+
+        expect(Client.request_sequence).to eq(1)
+      end
     end
 
     describe "#createreq" do
@@ -63,6 +78,18 @@ module MCollective
         message.stubs(:reply_to)
         result = client.createreq(message, "rspec")
         expect(result).to eq(message)
+      end
+
+      it "should leave the request sequence to the caller" do
+        Client.reset_request_sequence
+        message = Message.new("rspec", nil, {:agent => "rspec", :type => :request, :collective => "mcollective", :filter => Util.empty_filter, :options => Util.default_options})
+        message.stubs(:encode!)
+        client.stubs(:subscribe)
+        message.stubs(:reply_to)
+
+        client.createreq(message, "rspec")
+
+        expect(Client.request_sequence).to eq(0)
       end
 
       it "should create a new request if the message if not of type Message" do
@@ -164,6 +191,15 @@ module MCollective
         client.receive("erfs123")
       end
 
+      it "should accept a reply to any of several request ids and retry on the rest" do
+        Log.stubs(:debug)
+        Log.expects(:debug).with("Ignoring a message for some other client : Message reqid badmessage does not match our reqid other, erfs123")
+        @connector.stubs(:receive).returns(badmessage, message)
+        message.expects(:expected_msgid=).with(["other", "erfs123"])
+
+        expect(client.receive(["other", "erfs123"])).to eq(message)
+      end
+
       it "should log and retry if a SecurityValidationFailed expection is raised" do
         Log.expects(:warn).with("Ignoring a message that did not pass security validations")
         badmessage.stubs(:decode!).raises(SecurityValidationFailed)
@@ -205,26 +241,52 @@ module MCollective
 
       it "should thread the publisher and receiver if configured" do
         client.instance_variable_get(:@options)[:threaded] = true
-        client.expects(:threaded_req).with(request, 2, 0, ['rspec'])
+        client.expects(:threaded_req).with([request], 2, 0, ['rspec'])
         message.options[:threaded] = true
         client.req(message)
       end
 
       it "should not thread the publisher and receiver if configured" do
         client.instance_variable_set(:@threaded, false)
-        client.expects(:unthreaded_req).with(request, 2, 0, ['rspec'])
+        client.expects(:unthreaded_req).with([request], 2, 0, ['rspec'])
         client.req(message)
       end
 
       it "uses the publish_timeout from options when passed as an option" do
-        client.expects(:unthreaded_req).with(request, 5, 0, ['rspec'])
+        client.expects(:unthreaded_req).with([request], 5, 0, ['rspec'])
         client.req(message, nil, message.options.merge(:publish_timeout => 5))
       end
 
       it "uses the publish_timeout from config when passed as a config value" do
-        client.expects(:unthreaded_req).with(request, 10, 0, ['rspec'])
+        client.expects(:unthreaded_req).with([request], 10, 0, ['rspec'])
         client.instance_variable_get(:@config).expects(:publish_timeout).returns(10)
         client.req(message)
+      end
+
+      it "should publish several messages together and wait for all of their hosts" do
+        second = Message.new("rspec", nil, {:agent => "rspec",
+                                            :type => :direct_request,
+                                            :collective => "mcollective",
+                                            :filter => Util.empty_filter,
+                                            :options => Util.default_options})
+        second.discovered_hosts = ["other"]
+        client.expects(:unthreaded_req).with([request, request], 2, 0, ["rspec", "other"])
+        client.req([message, second])
+      end
+
+      it "should advance the request sequence once for all the messages of an exchange" do
+        Client.reset_request_sequence
+        second = Message.new("rspec", nil, {:agent => "rspec",
+                                            :type => :direct_request,
+                                            :collective => "mcollective",
+                                            :filter => Util.empty_filter,
+                                            :options => Util.default_options})
+        second.discovered_hosts = ["other"]
+        client.expects(:unthreaded_req).with([request, request], 2, 0, ["rspec", "other"])
+
+        client.req([message, second])
+
+        expect(Client.request_sequence).to eq(1)
       end
     end
 
@@ -232,9 +294,19 @@ module MCollective
       it "should start a publisher and then start a receiver" do
         request = mock
         request.stubs(:requestid).returns("erfs123")
-        client.expects(:start_publisher).with(request, 5)
-        client.expects(:start_receiver).with("erfs123", 2, 10)
-        client.unthreaded_req(request, 5, 10, 2)
+        client.expects(:start_publisher).with([request], 5)
+        client.expects(:start_receiver).with(["erfs123"], 2, 10)
+        client.unthreaded_req([request], 5, 10, 2)
+      end
+
+      it "should receive for the id of every request" do
+        first = mock
+        first.stubs(:requestid).returns("erfs123")
+        second = mock
+        second.stubs(:requestid).returns("erfs456")
+        client.expects(:start_publisher).with([first, second], 5)
+        client.expects(:start_receiver).with(["erfs123", "erfs456"], 2, 10)
+        client.unthreaded_req([first, second], 5, 10, 2)
       end
     end
 
@@ -246,10 +318,10 @@ module MCollective
         r_thread = mock
         Thread.expects(:new).yields.returns(p_thread)
         Thread.expects(:new).yields.returns(r_thread)
-        client.expects(:start_publisher).with(request, 5)
-        client.expects(:start_receiver).with("erfs123", 2, 15).returns(2)
+        client.expects(:start_publisher).with([request], 5)
+        client.expects(:start_receiver).with(["erfs123"], 2, 15).returns(2)
         p_thread.expects(:join)
-        result = client.threaded_req(request, 5, 10, 2)
+        result = client.threaded_req([request], 5, 10, 2)
         expect(result).to eq(2)
       end
     end
@@ -267,13 +339,25 @@ module MCollective
       it "should publish the message" do
         Timeout.stubs(:timeout).with(2).yields
         message.expects(:publish)
-        client.start_publisher(message, 2)
+        client.start_publisher([message], 2)
+      end
+
+      it "should publish every message within the one timeout" do
+        other = mock
+        other.stubs(:requestid)
+        other.stubs(:agent)
+        other.stubs(:ttl)
+        other.stubs(:collective)
+        Timeout.stubs(:timeout).with(2).yields
+        message.expects(:publish)
+        other.expects(:publish)
+        client.start_publisher([message, other], 2)
       end
 
       it "should log a warning on a timeout" do
         Timeout.stubs(:timeout).with(2).raises(Timeout::Error)
         Log.expects(:warn).with("Could not publish all messages. Publishing timed out.")
-        client.start_publisher(message,2)
+        client.start_publisher([message], 2)
       end
     end
 

@@ -40,6 +40,17 @@ module MCollective
 
           expect(@plugin.should_process_msg?(m, "rspec")).to eq(true)
         end
+
+        it "should accept any of several expected message ids" do
+          m = mock
+          m.stubs(:expected_msgid).returns(["rspec", "other"])
+
+          expect(@plugin.should_process_msg?(m, "other")).to eq(true)
+
+          expect {
+            @plugin.should_process_msg?(m, "fail")
+          }.to raise_error(MsgDoesNotMatchRequestID, "Got a message with id fail but was expecting rspec, other, ignoring message")
+        end
       end
 
       describe "#validate_filter?" do

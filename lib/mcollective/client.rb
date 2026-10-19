@@ -72,11 +72,17 @@ module MCollective
     # Sends a request and returns the generated request id, doesn't wait for
     # responses and doesn't execute any passed in code blocks for responses
     def sendreq(msg, agent, filter={})
+      @@request_sequence += 1 # rubocop:disable Style/ClassVars
+
       request = createreq(msg, agent, filter)
       publish(request)
       request.requestid
     end
 
+    # Builds and encodes a request and subscribes to its replies. The
+    # request sequence that names the reply subject is advanced by the
+    # caller, once per exchange, so that every request of an exchange and
+    # the subscription for their replies name the same subject.
     def createreq(msg, agent, filter={})
       if msg.is_a?(Message)
         request = msg
@@ -86,8 +92,6 @@ module MCollective
         request = Message.new(msg, nil, :agent => agent, :type => :request, :collective => collective, :filter => filter, :ttl => ttl)
         request.reply_to = @options[:reply_to] if @options[:reply_to]
       end
-
-      @@request_sequence += 1 # rubocop:disable Style/ClassVars
 
       request.encode!
       subscribe(agent, :reply) unless request.reply_to
@@ -120,8 +124,12 @@ module MCollective
     # with that ID and now you just want replies that matches that id, in that
     # case the current connection will just ignore all messages not directed at it
     # and keep waiting for more till it finds a matching message.
+    #
+    # The requestid can be an Array of ids, for the replies to several
+    # requests received together, and a reply to any of them is returned.
     def receive(requestid=nil)
       reply = nil
+      expected = requestid.is_a?(Array) ? requestid : [requestid]
 
       begin
         reply = @connection.receive
@@ -130,7 +138,7 @@ module MCollective
 
         reply.decode!
 
-        raise(MsgDoesNotMatchRequestID, "Message reqid #{reply.requestid} does not match our reqid #{requestid}") unless reply.requestid == requestid
+        raise(MsgDoesNotMatchRequestID, "Message reqid #{reply.requestid} does not match our reqid #{expected.join(', ')}") unless expected.include?(reply.requestid)
 
         Log.debug("Received reply to #{reply.requestid} from #{reply.payload[:senderid]}")
       rescue SecurityValidationFailed => e
@@ -160,52 +168,67 @@ module MCollective
     #   pp resp
     # }
     #
+    # A Message can stand in for the body, or an Array of Messages each
+    # addressed to its own node with its own body and its own request id,
+    # which are published together on one reply subject and whose replies
+    # are received together. The stat then names the first request's id.
+    #
     # It returns a hash of times and timeouts for discovery and total run is taken from the options
     # hash which in turn is generally built using MCollective::Optionparser
     def req(body, agent=nil, options=false, waitfor=[], &block)
-      if body.is_a?(Message)
-        agent = body.agent
-        waitfor = body.discovered_hosts || []
-        @options = body.options
+      bodies = body.is_a?(Array) ? body : [body]
+
+      if bodies.first.is_a?(Message)
+        agent = bodies.first.agent
+        waitfor = bodies.map {|message| message.discovered_hosts || []}.flatten
+        @options = bodies.first.options
       end
 
       @options = options if options
       threaded = @options[:threaded]
       timeout = @discoverer.discovery_timeout(@options[:timeout], @options[:filter])
-      request = createreq(body, agent, @options[:filter])
       publish_timeout = @options[:publish_timeout] || @config.publish_timeout
       stat = {:starttime => Time.now.to_f, :discoverytime => 0, :blocktime => 0, :totaltime => 0}
       $stdout.sync = true
       hosts_responded = 0
+      requests = []
 
       begin
+        # one sequence for the exchange, so the reply subject subscribed to
+        # in createreq is the one every request names in its reply-to header
+        @@request_sequence += 1 # rubocop:disable Style/ClassVars
+        requests = bodies.map {|message| createreq(message, agent, @options[:filter])}
+
         if threaded
-          hosts_responded = threaded_req(request, publish_timeout, timeout, waitfor, &block)
+          hosts_responded = threaded_req(requests, publish_timeout, timeout, waitfor, &block)
         else
-          hosts_responded = unthreaded_req(request, publish_timeout, timeout, waitfor, &block)
+          hosts_responded = unthreaded_req(requests, publish_timeout, timeout, waitfor, &block)
         end
       rescue Interrupt # rubocop:disable Lint/SuppressedException
       ensure
         unsubscribe(agent, :reply)
       end
 
-      update_stat(stat, hosts_responded, request.requestid)
+      update_stat(stat, hosts_responded, requests.first&.requestid)
     end
 
     # Starts the client receiver and publisher unthreaded.
     # This is the default client behaviour.
-    def unthreaded_req(request, publish_timeout, timeout, waitfor, &block)
-      start_publisher(request, publish_timeout)
-      start_receiver(request.requestid, waitfor, timeout, &block)
+    #
+    # The requests are the Array req builds, published together and
+    # received together.
+    def unthreaded_req(requests, publish_timeout, timeout, waitfor, &block)
+      start_publisher(requests, publish_timeout)
+      start_receiver(requests.map(&:requestid), waitfor, timeout, &block)
     end
 
     # Starts the client receiver and publisher in threads.
     # This is activated when the 'threader_client' configuration
     # option is set.
-    def threaded_req(request, publish_timeout, timeout, waitfor, &block)
+    def threaded_req(requests, publish_timeout, timeout, waitfor, &block)
       Log.debug("Starting threaded client")
       Thread.new do
-        start_publisher(request, publish_timeout)
+        start_publisher(requests, publish_timeout)
       end
 
       # When the client is threaded we add the publishing timeout to
@@ -215,19 +238,20 @@ module MCollective
       hosts_responded = 0
 
       receiver = Thread.new do
-        hosts_responded = start_receiver(request.requestid, waitfor, total_timeout, &block)
+        hosts_responded = start_receiver(requests.map(&:requestid), waitfor, total_timeout, &block)
       end
 
       receiver.join
       hosts_responded
     end
 
-    # Starts the request publishing routine
-    def start_publisher(request, publish_timeout)
+    # Starts the request publishing routine for the requests, all within
+    # the one publish timeout
+    def start_publisher(requests, publish_timeout)
       Log.debug("Starting publishing with publish timeout of #{publish_timeout}")
       begin
         Timeout.timeout(publish_timeout) do
-          publish(request)
+          requests.each {|request| publish(request)}
         end
       rescue Timeout::Error
         Log.warn("Could not publish all messages. Publishing timed out.")

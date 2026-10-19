@@ -153,8 +153,11 @@ module MCollective
       # Mostly used by security plugins to figure out if they should do the hard work of decrypting
       # etc messages that would only later on be ignored
       def should_process_msg?(msg, msgid)
-        if msg.expected_msgid && msg.expected_msgid != msgid
-          msgtext = "Got a message with id %s but was expecting %s, ignoring message" % [msgid, msg.expected_msgid]
+        expected = msg.expected_msgid
+        expected = [expected] unless expected.nil? || expected.is_a?(Array)
+
+        if expected && !expected.include?(msgid)
+          msgtext = "Got a message with id %s but was expecting %s, ignoring message" % [msgid, expected.join(", ")]
           Log.debug msgtext
           raise MsgDoesNotMatchRequestID, msgtext
         end

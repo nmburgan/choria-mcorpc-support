@@ -890,6 +890,114 @@ module MCollective
         end
       end
 
+      describe "#per_node_request" do
+        before do
+          # These stat keys must match the values returned by a generic Client
+          stats = {:noresponsefrom => [], :unexpectedresponsefrom => [], :responses => 0, :blocktime => 0, :totaltime => 0, :discoverytime => 0, :requestid => "823a3419a0975c3facbde121f72ab61f"}
+
+          @coreclient.stubs(:stats).returns(stats)
+        end
+
+        it "should require direct addressing" do
+          Config.instance.stubs(:direct_addressing).returns(false)
+
+          expect { @client.per_node_request("rspec", {"one" => {}}) }.to raise_error("Per node requests require direct addressing")
+        end
+
+        it "should refuse a node whose arguments bypass result processing" do
+          expect { @client.per_node_request("rspec", {"one" => {:process_results => false}}) }.to raise_error("Cannot bypass result processing for per node requests")
+        end
+
+        it "should validate the arguments of every node and name the node that fails" do
+          @client.expects(:validate_request).with("rspec", {:a => 1})
+          @client.expects(:validate_request).with("rspec", {:a => 2}).raises(DDLValidationError, "Action rspec needs a b argument")
+
+          expect { @client.per_node_request("rspec", {"one" => {:a => 1}, "two" => {:a => 2}}) }.to raise_error(DDLValidationError, "two: Action rspec needs a b argument")
+        end
+
+        it "should send every node a direct request carrying its own arguments and only the agent filter, and receive the replies together" do
+          @client.identity_filter("other_node")
+          @client.expects(:new_request).with("rspec", {:a => 1}).returns("req one")
+          @client.expects(:new_request).with("rspec", {:a => 2}).returns("req two")
+          @coreclient.expects(:req).with { |messages|
+            messages.map(&:payload) == ["req one", "req two"] &&
+              messages.map(&:discovered_hosts) == [["one"], ["two"]] &&
+              messages.all? {|message| message.type == :direct_request && message.filter == Util.empty_filter.merge("agent" => ["foo"])}
+          }.multiple_yields(["reply one"], ["reply two"])
+          @client.expects(:process_results_without_block).with("reply one", "rspec", nil).returns("one")
+          @client.expects(:process_results_without_block).with("reply two", "rspec", nil).returns("two")
+
+          expect(@client.per_node_request("rspec", {"one" => {:a => 1}, "two" => {:a => 2}})).to eq(["one", "two"])
+          expect(@client.stats[:requestid]).to eq("823a3419a0975c3facbde121f72ab61f")
+        end
+
+        it "should pass every reply to the block and return the stats" do
+          @client.stubs(:new_request).returns("req")
+          @coreclient.expects(:req).with { |messages| messages.size == 2 }.multiple_yields(["reply one"], ["reply two"])
+          @client.expects(:process_results_with_block).with("rspec", "reply one", instance_of(Proc), nil)
+          @client.expects(:process_results_with_block).with("rspec", "reply two", instance_of(Proc), nil)
+          @client.expects(:process_results_without_block).never
+
+          result = @client.per_node_request("rspec", {"one" => {}, "two" => {}}) { }
+
+          expect(result.class).to eq(Stats)
+          expect(result[:requestid]).to eq("823a3419a0975c3facbde121f72ab61f")
+        end
+
+        it "should send nothing and return no results when no nodes are given" do
+          client = Client.new("foo", {:options => {:filter => Util.empty_filter, :config => "/nonexisting", :stderr => @stderr}})
+          client.instance_variable_set("@client", @coreclient)
+          @coreclient.expects(:req).never
+
+          expect(client.per_node_request("rspec", {})).to eq([])
+          expect(@stderr.string).to eq("\nNo request sent, no nodes were given.")
+          expect(client.stats[:discovered]).to eq(0)
+        end
+
+        it "should batch the nodes by the batch size and sleep between batches" do
+          @client.batch_size = 1
+          @client.stubs(:new_request).returns("req")
+          @coreclient.expects(:req).with { |messages| messages.size == 1 }.twice
+          @client.expects(:sleep).with(1.0).once
+
+          expect(@client.per_node_request("rspec", {"one" => {}, "two" => {}})).to eq([])
+        end
+
+        it "should read a percentage batch size against the nodes given" do
+          @client.batch_size = "50%"
+          @client.stubs(:new_request).returns("req")
+          @coreclient.expects(:req).with { |messages| messages.size == 2 }.twice
+          @client.expects(:sleep).with(1.0).once
+
+          expect(@client.per_node_request("rspec", {"one" => {}, "two" => {}, "three" => {}, "four" => {}})).to eq([])
+        end
+
+        it "should send one batch and not sleep when the batch size exceeds the node count" do
+          @client.batch_size = 10
+          @client.stubs(:new_request).returns("req")
+          @coreclient.expects(:req).with { |messages| messages.size == 2 }.once
+          @client.expects(:sleep).never
+
+          expect(@client.per_node_request("rspec", {"one" => {}, "two" => {}})).to eq([])
+        end
+
+        it "should add up the stats of every batch and name the first request" do
+          stats = {:noresponsefrom => [], :unexpectedresponsefrom => [], :responses => 1, :blocktime => 2, :totaltime => 2, :discoverytime => 0, :requestid => "823a3419a0975c3facbde121f72ab61f"}
+          @coreclient.stubs(:stats).returns(stats)
+          @client.batch_size = 2
+          @client.stubs(:new_request).returns("req")
+          @coreclient.expects(:req).with { |messages| messages.size == 2 }.yields("reply")
+          @coreclient.expects(:req).with { |messages| messages.size == 1 }.yields("reply")
+          @client.stubs(:sleep)
+          @client.stubs(:process_results_without_block).returns("result")
+
+          expect(@client.per_node_request("rspec", {"one" => {}, "two" => {}, "three" => {}})).to eq(["result", "result"])
+          expect(@client.stats[:requestid]).to eq("823a3419a0975c3facbde121f72ab61f")
+          expect(@client.stats[:responses]).to eq(2)
+          expect(@client.stats[:blocktime]).to eq(5.0)
+        end
+      end
+
       describe "#batch_sleep_time=" do
         it "should correctly set the sleep" do
           Config.instance.stubs(:direct_addressing).returns(true)
