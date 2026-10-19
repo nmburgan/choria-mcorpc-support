@@ -17,6 +17,11 @@ module MCollective
 
             require "jgrep"
 
+            # jgrep 1.5, the last release for Ruby before 3.3, turns create_additions
+            # off through JSON.create_id=, which the json gem removed in 3.0 along
+            # with the feature itself
+            JSON.define_singleton_method(:create_id=) {|_id| nil} unless JSON.respond_to?(:create_id=)
+
             if JGrep.respond_to?("validate_expression")
               @_jgrep = true
             else

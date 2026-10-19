@@ -132,6 +132,13 @@ module MCollective
             end
           end
 
+          describe "#jgrep?" do
+            it "should keep JSON.create_id= callable so jgrep 1.5 works with json 3" do
+              expect(task.jgrep?).to be(true)
+              expect { JSON.create_id = nil }.not_to raise_error
+            end
+          end
+
           describe "#assert_replies" do
             let(:replies) do
               [
